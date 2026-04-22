@@ -1,0 +1,298 @@
+import 'dart:io';
+
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../models/analysis_snapshot.dart';
+import '../models/detection.dart';
+import '../models/lego_part.dart';
+import '../services/brickognize_client.dart';
+import '../services/brickognize_pipeline.dart';
+import '../services/element_lookup.dart';
+import '../services/history_service.dart';
+import '../services/kie_client.dart';
+import '../services/rebrickable_client.dart';
+
+final kieClientProvider = Provider<KieClient>((ref) {
+  final apiKey = dotenv.env['KIE_API_KEY'] ?? '';
+  final baseUrl = dotenv.env['KIE_BASE_URL'] ?? 'https://api.kie.ai';
+  final model = dotenv.env['KIE_MODEL'] ?? 'gemini-2.5-flash';
+  return KieClient(apiKey: apiKey, baseUrl: baseUrl, model: model);
+});
+
+final brickognizeClientProvider =
+    Provider<BrickognizeClient>((ref) => BrickognizeClient());
+
+final rebrickableClientProvider = Provider<RebrickableClient>((ref) {
+  return RebrickableClient(apiKey: dotenv.env['REBRICKABLE_API_KEY'] ?? '');
+});
+
+final brickognizePipelineProvider = Provider<BrickognizePipeline>((ref) {
+  return BrickognizePipeline(
+    brickognize: ref.watch(brickognizeClientProvider),
+  );
+});
+
+final historyServiceProvider =
+    Provider<HistoryService>((ref) => HistoryService());
+
+class AnalysisState {
+  final File? inventoryImage;
+  final List<LegoPart> inventory;
+  final File? pileImage;
+  final List<Detection> detections;
+  final bool busy;
+  final String? error;
+  final String? setLabel;
+  final List<AnalysisSnapshot> pastRuns; // matched-by-fingerprint history
+  final bool loadedFromHistory;
+  final int progressDone;
+  final int progressTotal;
+  final String progressLabel;
+  final List<RawIdentification> rawHits;
+  final int bboxesFound;
+
+  const AnalysisState({
+    this.inventoryImage,
+    this.inventory = const [],
+    this.pileImage,
+    this.detections = const [],
+    this.busy = false,
+    this.error,
+    this.setLabel,
+    this.pastRuns = const [],
+    this.loadedFromHistory = false,
+    this.progressDone = 0,
+    this.progressTotal = 0,
+    this.progressLabel = '',
+    this.rawHits = const [],
+    this.bboxesFound = 0,
+  });
+
+  AnalysisState copyWith({
+    File? inventoryImage,
+    List<LegoPart>? inventory,
+    File? pileImage,
+    List<Detection>? detections,
+    bool? busy,
+    String? error,
+    bool clearError = false,
+    String? setLabel,
+    bool clearSetLabel = false,
+    List<AnalysisSnapshot>? pastRuns,
+    bool? loadedFromHistory,
+    int? progressDone,
+    int? progressTotal,
+    String? progressLabel,
+    List<RawIdentification>? rawHits,
+    int? bboxesFound,
+  }) =>
+      AnalysisState(
+        inventoryImage: inventoryImage ?? this.inventoryImage,
+        inventory: inventory ?? this.inventory,
+        pileImage: pileImage ?? this.pileImage,
+        detections: detections ?? this.detections,
+        busy: busy ?? this.busy,
+        error: clearError ? null : (error ?? this.error),
+        setLabel: clearSetLabel ? null : (setLabel ?? this.setLabel),
+        pastRuns: pastRuns ?? this.pastRuns,
+        loadedFromHistory: loadedFromHistory ?? this.loadedFromHistory,
+        progressDone: progressDone ?? this.progressDone,
+        progressTotal: progressTotal ?? this.progressTotal,
+        progressLabel: progressLabel ?? this.progressLabel,
+        rawHits: rawHits ?? this.rawHits,
+        bboxesFound: bboxesFound ?? this.bboxesFound,
+      );
+}
+
+class AnalysisController extends StateNotifier<AnalysisState> {
+  final KieClient _client;
+  final BrickognizePipeline _pipeline;
+  final HistoryService _history;
+  final RebrickableClient _rebrickable;
+  AnalysisController(
+      this._client, this._pipeline, this._history, this._rebrickable)
+      : super(const AnalysisState());
+
+  void reset() => state = const AnalysisState();
+
+  void setLabel(String? label) {
+    state = state.copyWith(setLabel: label, clearSetLabel: label == null);
+  }
+
+  bool get rebrickableConfigured => _rebrickable.isConfigured;
+
+  /// Bypass photo OCR: fetch the official set inventory from Rebrickable.
+  Future<void> loadFromSetNumber(String setNumber) async {
+    state = state.copyWith(
+      busy: true,
+      clearError: true,
+      setLabel: setNumber,
+      progressLabel: 'Загружаю набор #$setNumber с Rebrickable…',
+    );
+    try {
+      final parts = await _rebrickable.fetchSetParts(setNumber);
+      // Check history for the same LEGO set.
+      final snap = AnalysisSnapshot(
+        id: '_tmp',
+        createdAt: DateTime.now(),
+        inventory: parts,
+        detections: const [],
+      );
+      final past = await _history.findByFingerprint(snap.fingerprint);
+      state = state.copyWith(
+        inventory: parts,
+        busy: false,
+        pastRuns: past,
+        progressLabel: '',
+      );
+    } catch (e) {
+      state = state.copyWith(busy: false, error: e.toString(), progressLabel: '');
+    }
+  }
+
+  Future<void> parseInventory(File image) async {
+    state = state.copyWith(
+      inventoryImage: image,
+      busy: true,
+      clearError: true,
+      progressLabel: 'Распознаю инвентарь…',
+    );
+    try {
+      var parts = await _client.parseInventory(image);
+
+      // Convert LEGO Element IDs (printed in instructions) to BrickLink-style
+      // Design IDs so downstream Brickognize matching works.
+      // Strategy: try offline mapping first (bundled asset), fall back to
+      // Rebrickable API for anything unresolved, if configured.
+      final needsResolve = parts
+          .where((p) => p.partId.length >= 6 && RegExp(r'^\d+$').hasMatch(p.partId))
+          .map((p) => p.partId)
+          .toSet();
+      if (needsResolve.isNotEmpty) {
+        state = state.copyWith(progressLabel: 'Сверяю ID с каталогом…');
+        final offline = await ElementLookup().resolveAll(needsResolve);
+        final stillMissing = needsResolve.difference(offline.keys.toSet());
+        Map<String, String> mapping = Map.of(offline);
+        if (stillMissing.isNotEmpty && _rebrickable.isConfigured) {
+          try {
+            final online = await _rebrickable.convertElementIds(stillMissing);
+            mapping.addAll(online);
+          } catch (_) {
+            // Non-fatal.
+          }
+        }
+        if (mapping.isNotEmpty) {
+          parts = parts
+              .map((p) => mapping.containsKey(p.partId)
+                  ? p.copyWith(partId: mapping[p.partId]!)
+                  : p)
+              .toList();
+        }
+      }
+
+      final snap = AnalysisSnapshot(
+        id: '_tmp',
+        createdAt: DateTime.now(),
+        inventory: parts,
+        detections: const [],
+      );
+      final past = await _history.findByFingerprint(snap.fingerprint);
+      state = state.copyWith(
+        inventory: parts,
+        busy: false,
+        pastRuns: past,
+        progressLabel: '',
+      );
+    } catch (e) {
+      state = state.copyWith(busy: false, error: e.toString());
+    }
+  }
+
+  void updateInventory(List<LegoPart> parts) {
+    state = state.copyWith(inventory: parts);
+  }
+
+  Future<void> analyzePile(File image) async {
+    state = state.copyWith(
+      pileImage: image,
+      busy: true,
+      clearError: true,
+      progressDone: 0,
+      progressTotal: 0,
+      progressLabel: 'Сканирую кучу…',
+    );
+    try {
+      final result = await _pipeline.identify(
+        image,
+        state.inventory,
+        onProgress: (p) {
+          if (!mounted) return;
+          state = state.copyWith(
+            progressDone: p.done,
+            progressTotal: p.total,
+            progressLabel: p.label,
+          );
+        },
+      );
+      state = state.copyWith(
+        detections: result.detections,
+        rawHits: result.rawHits,
+        bboxesFound: result.bboxesFound,
+        busy: false,
+        progressDone: state.progressTotal,
+      );
+      await _history.save(
+        inventory: state.inventory,
+        detections: result.detections,
+        setLabel: state.setLabel,
+        pileImage: image,
+        inventoryImage: state.inventoryImage,
+      );
+    } catch (e) {
+      state = state.copyWith(busy: false, error: e.toString());
+    }
+  }
+
+  /// Externally-produced detections (e.g. from TapIdentifyScreen) — save and
+  /// put them into state so ResultScreen can render.
+  Future<void> commitDetections(List<Detection> detections,
+      {required File pileImage}) async {
+    state = state.copyWith(
+      pileImage: pileImage,
+      detections: detections,
+      busy: false,
+      clearError: true,
+    );
+    await _history.save(
+      inventory: state.inventory,
+      detections: detections,
+      setLabel: state.setLabel,
+      pileImage: pileImage,
+      inventoryImage: state.inventoryImage,
+    );
+  }
+
+  /// Load a past snapshot into state, bypassing network calls.
+  void loadSnapshot(AnalysisSnapshot s) {
+    state = AnalysisState(
+      inventoryImage: s.inventoryImagePath != null
+          ? File(s.inventoryImagePath!)
+          : null,
+      pileImage: s.pileImagePath != null ? File(s.pileImagePath!) : null,
+      inventory: s.inventory,
+      detections: s.detections,
+      setLabel: s.setLabel,
+      loadedFromHistory: true,
+    );
+  }
+}
+
+final analysisProvider =
+    StateNotifierProvider<AnalysisController, AnalysisState>((ref) {
+  final client = ref.watch(kieClientProvider);
+  final pipeline = ref.watch(brickognizePipelineProvider);
+  final history = ref.watch(historyServiceProvider);
+  final rebrickable = ref.watch(rebrickableClientProvider);
+  return AnalysisController(client, pipeline, history, rebrickable);
+});
